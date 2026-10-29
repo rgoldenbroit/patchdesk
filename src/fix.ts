@@ -9,6 +9,14 @@ import { FIX_MODEL, MAX_FIX_ATTEMPTS } from "./config.js";
 import type { Finding } from "./scan.js";
 import type { Run } from "./state.js";
 import type { TriageVerdict } from "./triage.js";
+import {
+  assignUsage,
+  readAgentUsage,
+  rememberUsage,
+  savedCostSchema,
+  totalTokensSchema,
+  type TokenCount,
+} from "./usage.js";
 
 /** One package after the fix step. Saved on the run under `steps.fixes`. */
 export const fixResultSchema = z.object({
@@ -21,6 +29,10 @@ export const fixResultSchema = z.object({
   runIds: z.array(z.string()),
   requestIds: z.array(z.string()),
   summary: z.string(),
+  /** Whole-agent token total. From `getUsage`, or the sum of run results when that call throws. */
+  totalTokens: totalTokensSchema.optional(),
+  /** Charged cents, or `"unavailable"` when `getUsage` threw. Absent when the API has not reported a cost yet. */
+  cost: savedCostSchema.optional(),
   failure: z.string().optional(),
 });
 
@@ -82,6 +94,7 @@ export async function fixOne(run: Run, finding: Finding, verdict: TriageVerdict)
   }
   console.log(`worktree ${worktree}`);
 
+  const runUsages: TokenCount[] = [];
   let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
   try {
     // DECISION: give the fix agent read and edit tools only. Why: it should change source files, and a shell could run tests, rewrite the lockfile, or push before the gates run. Alternative: leave the default toolset, which includes shell, delete, and web search.
@@ -93,50 +106,52 @@ export async function fixOne(run: Run, finding: Finding, verdict: TriageVerdict)
     });
     result.agentId = agent.agentId;
 
-    const repair = await repairUntilGreen(agent, result, finding, verdict, worktree, version);
+    const repair = await repairUntilGreen(agent, result, finding, verdict, worktree, version, runUsages);
     if (!repair.ok) {
       result.failure = repair.failure;
-      return finish(result);
-    }
-    result.testsPassed = true;
+    } else {
+      result.testsPassed = true;
 
-    const stillPresent = await packageStillPresent(worktree, finding.package);
-    if (stillPresent) {
-      result.failure = `${finding.package} still appears in npm audit`;
-      return finish(result);
-    }
-    console.log(`audit clear ${finding.package}`);
+      const stillPresent = await packageStillPresent(worktree, finding.package);
+      if (stillPresent) {
+        result.failure = `${finding.package} still appears in npm audit`;
+      } else {
+        console.log(`audit clear ${finding.package}`);
 
-    // DECISION: commit only after npm test passes and the package is gone from npm audit. Why: a green test run and a clean audit are the proof the fix works, and the agent does not get to decide that for itself. Alternative: commit as soon as the agent says it is done.
-    // DECISION: open a pull request and stop. Why: a person still has to review the fix before it reaches main. Alternative: merge the branch from here.
-    const title = commitTitle(finding.package, version, finding.advisories.map((advisory) => advisory.ghsa));
-    await runChecked("git", ["add", "-A"], worktree);
-    await runChecked("git", ["commit", "-m", title], worktree);
-    await runChecked("git", ["push", "-u", "origin", result.branch], worktree);
-    const body = buildPrBody({
-      finding,
-      verdict,
-      version,
-      summary: result.summary,
-      testOutput: repair.testOutput,
-      attempts: result.attempts,
-      agentId: result.agentId,
-      requestIds: result.requestIds,
-      by: approved.by,
-      at: approved.at,
-    });
-    result.prUrl = await openPullRequest(worktree, result.branch, title, body);
-    return finish(result);
+        // DECISION: commit only after npm test passes and the package is gone from npm audit. Why: a green test run and a clean audit are the proof the fix works, and the agent does not get to decide that for itself. Alternative: commit as soon as the agent says it is done.
+        // DECISION: open a pull request and stop. Why: a person still has to review the fix before it reaches main. Alternative: merge the branch from here.
+        const title = commitTitle(finding.package, version, finding.advisories.map((advisory) => advisory.ghsa));
+        await runChecked("git", ["add", "-A"], worktree);
+        await runChecked("git", ["commit", "-m", title], worktree);
+        await runChecked("git", ["push", "-u", "origin", result.branch], worktree);
+        const body = buildPrBody({
+          finding,
+          verdict,
+          version,
+          summary: result.summary,
+          testOutput: repair.testOutput,
+          attempts: result.attempts,
+          agentId: result.agentId,
+          requestIds: result.requestIds,
+          by: approved.by,
+          at: approved.at,
+        });
+        result.prUrl = await openPullRequest(worktree, result.branch, title, body);
+      }
+    }
   } catch (err) {
     if (result.failure === undefined) {
       result.failure = errorMessage(err);
     }
-    return finish(result);
   } finally {
     if (agent !== undefined) {
+      // DECISION: call getUsage before dispose, and keep the fix result if that call throws. Why: billing is only available while the agent is open, and feature_unavailable must not fail a fix that already finished. Alternative: dispose first, then there is no agent left to ask.
+      const billed = await readAgentUsage(agent, runUsages);
+      assignUsage(result, billed);
       await agent[Symbol.asyncDispose]();
     }
   }
+  return finish(result);
 }
 
 type RepairResult = { ok: true; testOutput: string } | { ok: false; failure: string };
@@ -152,13 +167,14 @@ async function repairUntilGreen(
   verdict: TriageVerdict,
   worktree: string,
   version: string,
+  runUsages: TokenCount[],
 ): Promise<RepairResult> {
   let prompt = buildPrompt(finding, verdict, version);
   let failedAttempts = 0;
   let testOutput = "";
 
   while (failedAttempts < MAX_FIX_ATTEMPTS) {
-    const sent = await sendFix(agent, result, prompt);
+    const sent = await sendFix(agent, result, prompt, runUsages);
     if (!sent.ok) {
       return sent;
     }
@@ -213,12 +229,13 @@ async function sendFix(
   agent: Awaited<ReturnType<typeof Agent.create>>,
   result: FixResult,
   prompt: string,
+  runUsages: TokenCount[],
 ): Promise<{ ok: true } | { ok: false; failure: string }> {
   const agentRun = await agent.send(prompt);
   result.attempts += 1;
   console.log(`attempt ${result.attempts}`);
   try {
-    const watched = await watchRun(agentRun);
+    const watched = await watchRun(agentRun, runUsages);
     result.runIds.push(watched.id);
     if (watched.requestId !== undefined) {
       result.requestIds.push(watched.requestId);
@@ -240,7 +257,7 @@ async function sendFix(
  * Prints each finished tool call, then waits for the run.
  * Throws when the run did not finish, using the SDK's error message.
  */
-async function watchRun(agentRun: AgentRun): Promise<RunResult> {
+async function watchRun(agentRun: AgentRun, runUsages: TokenCount[]): Promise<RunResult> {
   for await (const event of agentRun.stream()) {
     if (event.type === "tool_call" && event.status === "completed") {
       const summary = summarizeToolArgs(event.args);
@@ -249,6 +266,7 @@ async function watchRun(agentRun: AgentRun): Promise<RunResult> {
   }
 
   const watched = await agentRun.wait();
+  rememberUsage(runUsages, watched.usage);
   if (watched.status !== "finished") {
     const message = watched.error?.message;
     throw new Error(

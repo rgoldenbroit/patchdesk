@@ -2,6 +2,7 @@ import { Agent, type Run, type RunResult } from "@cursor/sdk";
 import { z } from "zod";
 import { TRIAGE_MODEL } from "./config.js";
 import type { Finding } from "./scan.js";
+import { assignUsage, readAgentUsage, rememberUsage, savedCostSchema, totalTokensSchema, type TokenCount } from "./usage.js";
 
 /** How urgent PatchDesk thinks a finding is, after looking at the app's own code. */
 const prioritySchema = z.enum(["fix-now", "fix-soon", "defer"]);
@@ -34,6 +35,8 @@ const tokenUsageSchema = z.object({
 /**
  * What `triage` returns, and what we store on the run record.
  * `requestId`, `durationMs`, and `usage` are optional because the SDK leaves them off when it has no value.
+ * `usage` is the last run's own token breakdown.
+ * `totalTokens` and `cost` are the billed figures for the whole agent, read from `getUsage` just before the agent is closed.
  */
 export const triageResultSchema = z.object({
   agentId: z.string(),
@@ -41,6 +44,10 @@ export const triageResultSchema = z.object({
   requestId: z.string().optional(),
   durationMs: z.number().optional(),
   usage: tokenUsageSchema.optional(),
+  /** Whole-agent token total. From `getUsage`, or the sum of run results when that call throws. */
+  totalTokens: totalTokensSchema.optional(),
+  /** Charged cents, or `"unavailable"` when `getUsage` threw. Absent when the API has not reported a cost yet. */
+  cost: savedCostSchema.optional(),
   verdicts: z.array(triageVerdictSchema),
 });
 
@@ -96,19 +103,21 @@ export async function triage(repoDir: string, findings: readonly Finding[]): Pro
     tools: ["read", "grep", "glob", "ls"],
   });
 
+  const runUsages: TokenCount[] = [];
+  let outcome: TriageResult | undefined;
   try {
     const first = await agent.send(buildPrompt(findings));
-    let result = await watchRun(first);
+    let result = await watchRun(first, runUsages);
     let verdicts: TriageVerdict[];
     try {
       verdicts = parseTriageVerdicts(result.result ?? "");
     } catch (err) {
       const followUp = await agent.send(correctionPrompt(err));
-      result = await watchRun(followUp);
+      result = await watchRun(followUp, runUsages);
       verdicts = parseTriageVerdicts(result.result ?? "");
     }
 
-    return {
+    outcome = {
       agentId: agent.agentId,
       runId: result.id,
       requestId: result.requestId,
@@ -116,7 +125,13 @@ export async function triage(repoDir: string, findings: readonly Finding[]): Pro
       usage: result.usage,
       verdicts: verdictsForFindings(findings, verdicts),
     };
+    return outcome;
   } finally {
+    // DECISION: call getUsage before dispose, and keep the verdicts if that call throws. Why: the SDK says to read billing while the agent is still open, and feature_unavailable must not throw away a finished triage. Alternative: dispose first, which closes the agent before we can ask for the cost.
+    const billed = await readAgentUsage(agent, runUsages);
+    if (outcome !== undefined) {
+      assignUsage(outcome, billed);
+    }
     await agent[Symbol.asyncDispose]();
   }
 }
@@ -125,7 +140,7 @@ export async function triage(repoDir: string, findings: readonly Finding[]): Pro
  * Prints each finished tool call, then waits for the run.
  * Throws when the run did not finish, using the SDK's error message.
  */
-async function watchRun(run: Run): Promise<RunResult> {
+async function watchRun(run: Run, runUsages: TokenCount[]): Promise<RunResult> {
   for await (const event of run.stream()) {
     if (event.type === "tool_call" && event.status === "completed") {
       const summary = summarizeToolArgs(event.args);
@@ -134,6 +149,7 @@ async function watchRun(run: Run): Promise<RunResult> {
   }
 
   const result = await run.wait();
+  rememberUsage(runUsages, result.usage);
   if (result.status !== "finished") {
     const message = result.error?.message;
     throw new Error(

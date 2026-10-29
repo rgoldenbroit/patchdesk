@@ -3,8 +3,9 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fixOne, type FixResult } from "./fix.js";
 import { gate, type ApprovalAsk, type GateDecision } from "./gate.js";
+import { writeReport } from "./report.js";
 import { scan, type Finding } from "./scan.js";
-import { newRun, saveRun } from "./state.js";
+import { newRun, saveRun, type Run } from "./state.js";
 import { triage, type TriageVerdict } from "./triage.js";
 
 const USAGE = "usage: npm run patchdesk -- run --repo <path> [--triage-only] [--yes]";
@@ -19,18 +20,25 @@ const COLUMN_GAP = "  ";
  * Resolves the repo, scans it, asks the triage agent for a verdict on each finding,
  * then asks a person which of those fixes to approve.
  * Each approved package is fixed on its own branch. A pull request is opened when the tests and the audit pass.
- * Each step is saved. `--triage-only` stops before the approval questions.
+ * Each step is saved, with the time it started and the time it finished.
+ * At the end, a markdown report is written to `runs/<runId>.md` and that path is printed as the last line.
+ * `--triage-only` stops before the approval questions. It still writes the report.
  * `--yes` approves fixes that are not major upgrades without asking. A major upgrade still asks.
  */
 async function main(): Promise<void> {
   const { repo, triageOnly, yes } = parseArgs(process.argv.slice(2));
   const repoDir = await resolveRepo(repo);
   const run = newRun(repoDir);
+
+  const scanStartedAt = stamp();
   run.steps.scan = await scan(repoDir);
+  run.timings.scan = { startedAt: scanStartedAt, endedAt: stamp() };
   await saveRun(run);
   printTable(run.steps.scan);
 
+  const triageStartedAt = stamp();
   const triageResult = await triage(repoDir, run.steps.scan);
+  run.timings.triage = { startedAt: triageStartedAt, endedAt: stamp() };
   run.steps.triage = triageResult;
   await saveRun(run);
   console.log("");
@@ -39,14 +47,18 @@ async function main(): Promise<void> {
   console.log(`run id: ${run.runId}`);
 
   if (triageOnly) {
+    // DECISION: write the report for a triage-only run too. Why: that run still finished a scan and a triage, and the last line should still be the report path. Alternative: write the file only after the gate and the fixes.
+    await writeAndPrintReport(run);
     return;
   }
 
   // DECISION: pass --yes into the gate instead of answering inside readline. Why: the gate is the only place that knows whether this fix is a major upgrade, and a major upgrade still has to be asked. Alternative: answer "y" inside createAsk whenever --yes is set, which would also auto-approve a major upgrade.
+  const gateStartedAt = stamp();
   const prompts = createAsk();
   let decisions: GateDecision[];
   try {
     decisions = await gate(run.steps.scan, triageResult.verdicts, prompts.ask, { yes });
+    run.timings.gate = { startedAt: gateStartedAt, endedAt: stamp() };
     run.steps.gate = decisions;
     await saveRun(run);
     console.log("");
@@ -60,6 +72,7 @@ async function main(): Promise<void> {
     throw new Error("run is missing its scan");
   }
   run.steps.fixes = [];
+  run.timings.fixes = [];
   for (const decision of decisions) {
     if (decision.decision !== "approved") {
       continue;
@@ -69,12 +82,30 @@ async function main(): Promise<void> {
     if (finding === undefined || verdict === undefined) {
       throw new Error(`approved package ${decision.package} is missing from the scan or triage`);
     }
+    const fixStartedAt = stamp();
     const result = await fixOne(run, finding, verdict);
+    run.timings.fixes.push({ package: decision.package, startedAt: fixStartedAt, endedAt: stamp() });
     run.steps.fixes.push(result);
     await saveRun(run);
     console.log("");
     printFixResult(result);
   }
+
+  await writeAndPrintReport(run);
+}
+
+/** The current time as an ISO string. This is a step's start or end. */
+function stamp(): string {
+  return new Date().toISOString();
+}
+
+/**
+ * Writes the markdown report and prints its path.
+ * Nothing is printed after this, so the path is the last line of a finished run.
+ */
+async function writeAndPrintReport(run: Run): Promise<void> {
+  // DECISION: print only the path, with no label. Why: the last line of output is the report path, and a label would make that line harder to copy. Alternative: print "report: <path>".
+  console.log(await writeReport(run));
 }
 
 /**

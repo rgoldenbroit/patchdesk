@@ -9,14 +9,35 @@ import { triageResultSchema } from "./triage.js";
 
 const JSON_INDENT = 2;
 
+/** When one step started and when it finished. Both are ISO timestamps. */
+const stepTimingSchema = z.object({
+  startedAt: z.string(),
+  endedAt: z.string(),
+});
+
+/** The same clock for one package's fix, plus the package name so the report can label the row. */
+const fixTimingSchema = stepTimingSchema.extend({
+  package: z.string().min(1),
+});
+
 /**
  * One PatchDesk run, saved as `runs/<runId>.json`.
  * Scan fills `steps.scan`. Triage fills `steps.triage`. The gate fills `steps.gate`. The fix step fills `steps.fixes`.
+ * `timings` records the start and end of each of those steps. The markdown report is written beside this file.
  */
 const runSchema = z.object({
   runId: z.string(),
   repoDir: z.string(),
   startedAt: z.string(),
+  // DECISION: keep the clocks on `timings` instead of wrapping each step. Why: `steps.scan` and `steps.gate` are arrays the rest of the program already reads, and a clock does not fit inside an array. Alternative: wrap every step in `{ startedAt, endedAt, data }`.
+  timings: z
+    .object({
+      scan: stepTimingSchema.optional(),
+      triage: stepTimingSchema.optional(),
+      gate: stepTimingSchema.optional(),
+      fixes: z.array(fixTimingSchema).optional(),
+    })
+    .default({}),
   steps: z.object({
     scan: z.array(findingSchema).optional(),
     triage: triageResultSchema.optional(),
@@ -40,6 +61,7 @@ export function newRun(repoDir: string): Run {
     runId: startedAt.replaceAll(":", "-").replaceAll(".", "-"),
     repoDir,
     startedAt,
+    timings: {},
     steps: {},
   };
 }
@@ -71,16 +93,27 @@ export async function loadRun(runId: string): Promise<Run> {
   return run;
 }
 
+/** Absolute path of `runs/<runId>.json`. The id is checked so it cannot escape the runs folder. */
+export function runFile(runId: string): string {
+  assertRunId(runId);
+  return path.join(runsDir(), `${runId}.json`);
+}
+
+/** Absolute path of `runs/<runId>.md`. The id is checked so it cannot escape the runs folder. */
+export function reportFile(runId: string): string {
+  assertRunId(runId);
+  return path.resolve(runsDir(), `${runId}.md`);
+}
+
 /**
- * Absolute path of `runs/<runId>.json`.
- * The id is checked so a value like `../secret` cannot escape the runs folder.
+ * Rejects a run id that is not the timestamp shape from `newRun`.
+ * The id is used as a file name, so a value like `../secret` must not get through.
  */
-function runFile(runId: string): string {
+function assertRunId(runId: string): void {
   // DECISION: only accept the timestamp id shape. Why: the id is used as a file name. Alternative: join whatever string we are given and hope it stays inside `runs/`.
   if (!RUN_ID_PATTERN.test(runId)) {
     throw new Error(`invalid run id: ${runId}`);
   }
-  return path.join(runsDir(), `${runId}.json`);
 }
 
 /**
