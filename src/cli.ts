@@ -1,10 +1,13 @@
 import { stat } from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
+import { fixOne, type FixResult } from "./fix.js";
+import { gate, type ApprovalAsk, type GateDecision } from "./gate.js";
 import { scan, type Finding } from "./scan.js";
 import { newRun, saveRun } from "./state.js";
 import { triage, type TriageVerdict } from "./triage.js";
 
-const USAGE = "usage: npm run patchdesk -- run --repo <path> [--triage-only]";
+const USAGE = "usage: npm run patchdesk -- run --repo <path> [--triage-only] [--yes]";
 
 const TABLE_HEADERS = ["package", "severity", "advisories", "fix version", "major upgrade"] as const;
 
@@ -12,13 +15,15 @@ const TABLE_HEADERS = ["package", "severity", "advisories", "fix version", "majo
 const COLUMN_GAP = "  ";
 
 /**
- * `npm run patchdesk -- run --repo <path> [--triage-only]`
+ * `npm run patchdesk -- run --repo <path> [--triage-only] [--yes]`
  * Resolves the repo, scans it, asks the triage agent for a verdict on each finding,
- * saves both, and prints the two tables plus the run id.
- * `--triage-only` stops after that. Later steps will run only when the flag is absent.
+ * then asks a person which of those fixes to approve.
+ * Each approved package is fixed on its own branch. A pull request is opened when the tests and the audit pass.
+ * Each step is saved. `--triage-only` stops before the approval questions.
+ * `--yes` approves fixes that are not major upgrades without asking. A major upgrade still asks.
  */
 async function main(): Promise<void> {
-  const { repo, triageOnly } = parseArgs(process.argv.slice(2));
+  const { repo, triageOnly, yes } = parseArgs(process.argv.slice(2));
   const repoDir = await resolveRepo(repo);
   const run = newRun(repoDir);
   run.steps.scan = await scan(repoDir);
@@ -36,23 +41,62 @@ async function main(): Promise<void> {
   if (triageOnly) {
     return;
   }
+
+  // DECISION: pass --yes into the gate instead of answering inside readline. Why: the gate is the only place that knows whether this fix is a major upgrade, and a major upgrade still has to be asked. Alternative: answer "y" inside createAsk whenever --yes is set, which would also auto-approve a major upgrade.
+  const prompts = createAsk();
+  let decisions: GateDecision[];
+  try {
+    decisions = await gate(run.steps.scan, triageResult.verdicts, prompts.ask, { yes });
+    run.steps.gate = decisions;
+    await saveRun(run);
+    console.log("");
+    printDecisions(decisions);
+  } finally {
+    prompts.close();
+  }
+
+  const findings = run.steps.scan;
+  if (findings === undefined) {
+    throw new Error("run is missing its scan");
+  }
+  run.steps.fixes = [];
+  for (const decision of decisions) {
+    if (decision.decision !== "approved") {
+      continue;
+    }
+    const finding = findings.find((item) => item.package === decision.package);
+    const verdict = triageResult.verdicts.find((item) => item.package === decision.package);
+    if (finding === undefined || verdict === undefined) {
+      throw new Error(`approved package ${decision.package} is missing from the scan or triage`);
+    }
+    const result = await fixOne(run, finding, verdict);
+    run.steps.fixes.push(result);
+    await saveRun(run);
+    console.log("");
+    printFixResult(result);
+  }
 }
 
 /**
- * Reads `run --repo <path> [--triage-only]` from the argument list.
- * `--triage-only` takes no value. Anything else is a usage error.
+ * Reads `run --repo <path> [--triage-only] [--yes]` from the argument list.
+ * `--triage-only` and `--yes` take no value. Anything else is a usage error.
  */
-function parseArgs(argv: readonly string[]): { repo: string; triageOnly: boolean } {
+function parseArgs(argv: readonly string[]): { repo: string; triageOnly: boolean; yes: boolean } {
   if (argv[0] !== "run") {
     throw new Error(USAGE);
   }
 
   let repo: string | undefined;
   let triageOnly = false;
+  let yes = false;
   for (let index = 1; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--triage-only") {
       triageOnly = true;
+      continue;
+    }
+    if (token === "--yes") {
+      yes = true;
       continue;
     }
     if (token !== "--repo") {
@@ -69,7 +113,26 @@ function parseArgs(argv: readonly string[]): { repo: string; triageOnly: boolean
   if (repo === undefined) {
     throw new Error(USAGE);
   }
-  return { repo, triageOnly };
+  return { repo, triageOnly, yes };
+}
+
+/**
+ * Builds the `ask` function the gate calls.
+ * The terminal opens on the first question and closes when the gate is done.
+ * Tests never call this. They pass their own `ask`.
+ */
+function createAsk(): { ask: ApprovalAsk; close: () => void } {
+  let rl: ReturnType<typeof createInterface> | undefined;
+  return {
+    ask(prompt: string): Promise<string> {
+      // DECISION: open the terminal on the first question. Why: --yes can finish without a prompt, and opening stdin early would hold the terminal for no reason. Alternative: open it as soon as the gate starts, even when nobody is asked.
+      rl ??= createInterface({ input: process.stdin, output: process.stdout });
+      return rl.question(prompt);
+    },
+    close(): void {
+      rl?.close();
+    },
+  };
 }
 
 /**
@@ -96,6 +159,21 @@ async function resolveRepo(repo: string): Promise<string> {
 }
 
 const TRIAGE_HEADERS = ["package", "npm severity", "PatchDesk priority", "evidence"] as const;
+
+/** Prints the pull request URL, or the reason the fix stopped. */
+function printFixResult(result: FixResult): void {
+  if (result.prUrl !== undefined) {
+    console.log(`${result.package}  ${result.prUrl}`);
+    return;
+  }
+  console.log(`${result.package}  ${result.failure ?? "fix failed"}`);
+}
+
+/** Prints one row per approval decision, in scan order. */
+function printDecisions(decisions: readonly GateDecision[]): void {
+  const rows = decisions.map((decision) => [decision.package, decision.decision]);
+  printAlignedTable(["package", "decision"], rows);
+}
 
 /** Prints one row per finding. The advisories cell is a count, not the full list. */
 function printTable(findings: readonly Finding[]): void {

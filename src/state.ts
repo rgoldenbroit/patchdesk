@@ -2,6 +2,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { fixResultSchema } from "./fix.js";
+import { gateDecisionSchema } from "./gate.js";
 import { findingSchema } from "./scan.js";
 import { triageResultSchema } from "./triage.js";
 
@@ -9,7 +11,7 @@ const JSON_INDENT = 2;
 
 /**
  * One PatchDesk run, saved as `runs/<runId>.json`.
- * Later steps (gate, fixes) fill in their own keys. Scan fills `steps.scan`. Triage fills `steps.triage`.
+ * Scan fills `steps.scan`. Triage fills `steps.triage`. The gate fills `steps.gate`. The fix step fills `steps.fixes`.
  */
 const runSchema = z.object({
   runId: z.string(),
@@ -18,8 +20,8 @@ const runSchema = z.object({
   steps: z.object({
     scan: z.array(findingSchema).optional(),
     triage: triageResultSchema.optional(),
-    gate: z.unknown().optional(),
-    fixes: z.unknown().optional(),
+    gate: z.array(gateDecisionSchema).optional(),
+    fixes: z.array(fixResultSchema).optional(),
   }),
 });
 
